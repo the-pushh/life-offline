@@ -218,6 +218,7 @@ async def scrape_saved_posts(
     data_dir: Path,
     on_event,
     source_label: str = "Saved",
+    known_urls: set[str] | None = None,
 ) -> list[dict]:
     session_file = data_dir / "session.json"
     if not session_file.exists():
@@ -234,7 +235,7 @@ async def scrape_saved_posts(
 
     async def on_response(response) -> None:
         url = response.url
-        if "feed/saved" not in url and "api/graphql" not in url:
+        if "feed/saved" not in url and "graphql" not in url and "/api/v1/" not in url:
             return
         try:
             body = await response.text()
@@ -297,9 +298,11 @@ async def scrape_saved_posts(
     await page.wait_for_timeout(2_500)
 
     # ── Lightbox loop ──────────────────────────────────────────────────────────
+    known_urls = known_urls or set()
     all_reels: list[dict] = []
     seen: set[str] = set()
     stall = 0
+    consecutive_empty = 0
 
     while stall < 2:
         await page.wait_for_timeout(400)
@@ -314,9 +317,9 @@ async def scrape_saved_posts(
             stall = 0
             seen.add(canon)
 
+            is_known = canon in known_urls
             partial = api_meta.get(canon, {})
 
-            # Author: API meta (most reliable) > URL path > dialog header > fallback
             author = (
                 partial.get("sender")
                 or _author_from_url(current_url)
@@ -326,6 +329,21 @@ async def scrape_saved_posts(
 
             caption = await _safe_eval(page, _CAPTION_JS)
             thumbnail = partial.get("thumbnail") or await _safe_eval(page, _OG_IMAGE_JS)
+
+            # Detect Instagram rate-limiting: lightbox stops rendering real data
+            is_empty = author == "unknown" and not thumbnail and not caption
+            if is_empty:
+                consecutive_empty += 1
+                if consecutive_empty >= 5:
+                    on_event({"type": "log", "msg": f"⚠ Instagram stopped serving data after {len(all_reels)} posts (rate limited) — stopping scrape."})
+                    break
+                # Skip storing/emitting garbage entries
+                moved = await _navigate_to_next_post(page, on_event)
+                if not moved:
+                    break
+                continue
+            else:
+                consecutive_empty = 0
 
             reel: dict = {
                 "url": canon,
@@ -339,15 +357,19 @@ async def scrape_saved_posts(
                 "carousel_items": partial.get("carousel_items", []),
             }
             all_reels.append(reel)
-            on_event({"type": "reel", "data": reel})
 
-            pt = reel["post_type"]
-            n_items = len(reel["carousel_items"])
-            label = f" [{pt}, {n_items} items]" if n_items else f" [{pt}]"
-            on_event({
-                "type": "log",
-                "msg": f"  [{len(all_reels)}] @{author}{label} {'✓' if caption else '✗ no caption'}",
-            })
+            if is_known:
+                on_event({"type": "log_replace", "replace_id": "saved_skip",
+                          "msg": f"  ↩ [{len(all_reels)}] @{author} already scraped"})
+            else:
+                on_event({"type": "reel", "data": reel})
+                pt = reel["post_type"]
+                n_items = len(reel["carousel_items"])
+                lbl = f" [{pt}, {n_items} items]" if n_items else f" [{pt}]"
+                on_event({
+                    "type": "log",
+                    "msg": f"  [{len(all_reels)}] @{author}{lbl} {'✓' if caption else '✗ no caption'}",
+                })
 
         moved = await _navigate_to_next_post(page, on_event)
         if not moved:

@@ -11,6 +11,7 @@ interface Props {
   onMediaReady: (url: string, result: { video_path?: string; image_paths?: string[] }) => void;
   onCaptionFetch: (url: string) => void;
   onTranscriptFetch: (url: string) => void;
+  onDownload?: (url: string) => void;
 }
 
 export default function ReelModal({
@@ -20,6 +21,7 @@ export default function ReelModal({
   onMediaReady,
   onCaptionFetch,
   onTranscriptFetch,
+  onDownload,
 }: Props) {
   const [currentIdx, setCurrentIdx] = useState(() =>
     Math.max(0, allReels.findIndex((r) => r.url === reel.url))
@@ -60,16 +62,11 @@ export default function ReelModal({
 
   async function triggerDownload() {
     setPhase("downloading");
-    const res = await downloadVideo(currentReel.url);
-    if (res.video_path || res.image_paths?.length) {
-      const update: { video_path?: string; image_paths?: string[] } = {};
-      if (res.video_path) update.video_path = res.video_path;
-      if (res.image_paths) update.image_paths = res.image_paths;
-      setPhase("ready");
-      onMediaReady(currentReel.url, update);
+    if (onDownload) {
+      onDownload(currentReel.url);
     } else {
-      setPhase("error");
-      setErrorMsg(res.error ?? "Download failed");
+      const res = await downloadVideo(currentReel.url);
+      if (res.error) { setPhase("error"); setErrorMsg(res.error); }
     }
   }
 

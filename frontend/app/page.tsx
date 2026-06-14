@@ -1,10 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import TopBar from "@/components/TopBar";
-import ActivityLog, { classifyLine, type LogItem, type LogGroup } from "@/components/ActivityLog";
+import ActivityLog, { classifyLine, type LogItem, type LogGroup, type LogStatus } from "@/components/ActivityLog";
 import ReelsTable from "@/components/ReelsTable";
-import OnboardingDialog from "@/components/OnboardingDialog";
 import VideoModal from "@/components/VideoModal";
 import SourceTabs from "@/components/SourceTabs";
 import AddSourceModal from "@/components/AddSourceModal";
@@ -20,7 +20,10 @@ import {
   startDownloadAll,
   refetchCaption,
   refetchTranscript,
+  downloadVideo,
   clearSession,
+  deleteSource,
+  cancelJob,
   openJobSocket,
   API_BASE,
   type Reel,
@@ -62,11 +65,35 @@ export default function Home() {
   const [rescrapeTarget, setRescrapeTarget] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [transcriptionProgress, setTranscriptionProgress] = useState({ current: 0, total: 0 });
+  const [downloadProgress, setDownloadProgress] = useState({ current: 0, total: 0 });
   const [transcribingUrls, setTranscribingUrls] = useState<Set<string>>(new Set());
+  const [downloadingUrls, setDownloadingUrls] = useState<Set<string>>(new Set());
   const socketRef = useRef<WebSocket | null>(null);
+  const stallTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const captionsCount = reels.filter((r) => r.caption).length;
   const isActive = status !== "idle";
+
+  const overallProgress = useMemo(() => {
+    if (status === "transcripts" && transcriptionProgress.total > 0) {
+      return Math.round((transcriptionProgress.current / transcriptionProgress.total) * 100);
+    }
+    if (status === "downloading" && downloadProgress.total > 0) {
+      return Math.round((downloadProgress.current / downloadProgress.total) * 100);
+    }
+    if (status === "scraping" || status === "captions") {
+      const capStatus = logs.find(
+        (item): item is LogStatus =>
+          item.type === "status" &&
+          ["cap_progress", "caption_progress"].includes((item as LogStatus).replaceId)
+      );
+      if (capStatus) {
+        const m = capStatus.text.match(/\[(\d+)\/(\d+)\]/);
+        if (m) return Math.min(100, Math.round((parseInt(m[1]) / parseInt(m[2])) * 100));
+      }
+    }
+    return 0;
+  }, [status, transcriptionProgress, downloadProgress, logs]);
 
   // Derived: per-source reel counts and filtered reels
   const reelCounts = useMemo(() => {
@@ -79,10 +106,12 @@ export default function Home() {
 
   const filteredReels = useMemo(
     () =>
-      !activeSource
+      configuredSources.length === 0
+        ? []
+        : !activeSource
         ? reels
         : reels.filter((r) => r.source_label === activeSource),
-    [reels, activeSource]
+    [reels, activeSource, configuredSources.length]
   );
 
   // Reset search when switching tabs
@@ -138,6 +167,20 @@ export default function Home() {
     ]);
   }, []);
 
+  const replaceLog = useCallback((replaceId: string, text: string, kind?: "info" | "success" | "error" | "reel") => {
+    const lineKind = kind ?? classifyLine(text);
+    setLogs((prev) => {
+      const idx = prev.findIndex((item) => item.type === "status" && (item as LogStatus).replaceId === replaceId);
+      const updated: LogItem = { type: "status", id: idx >= 0 ? prev[idx].id : nextId(), replaceId, text, kind: lineKind };
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = updated;
+        return next;
+      }
+      return [...prev, updated];
+    });
+  }, []);
+
   const endGroup = useCallback((success?: boolean) => {
     const gid = activeGroupIdRef.current;
     if (gid === null) return;
@@ -153,11 +196,25 @@ export default function Home() {
 
   function connectJob(jobId: string, jobStatus: Status) {
     socketRef.current?.close();
+    if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+
     const ws = openJobSocket(jobId);
     socketRef.current = ws;
     setStatus(jobStatus);
 
+    const resetStall = () => {
+      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = setTimeout(async () => {
+        addLog("⚠ No activity for 5 minutes — job stalled (computer may have slept). Cancelling. Re-run download to continue from where it left off.", "error");
+        await cancelJob();
+        setStatus("idle");
+        setDownloadProgress({ current: 0, total: 0 });
+      }, 300_000);
+    };
+    resetStall();
+
     ws.onmessage = (ev) => {
+      resetStall();
       const event: WsEvent = JSON.parse(ev.data);
 
       switch (event.type) {
@@ -177,6 +234,18 @@ export default function Home() {
           setTranscriptionProgress({ current: event.current ?? 0, total: event.total ?? 0 });
           break;
 
+        case "download_progress":
+          setDownloadProgress({ current: event.current ?? 0, total: event.total ?? 0 });
+          break;
+
+        case "transcribing_url":
+          if (event.url) setTranscribingUrls((s) => new Set(s).add(event.url!));
+          break;
+
+        case "log_replace":
+          replaceLog(event.replace_id ?? "status", event.msg ?? "");
+          break;
+
         case "log":
           addLog(event.msg ?? "");
           break;
@@ -184,10 +253,15 @@ export default function Home() {
         case "reel":
           if (event.data) {
             setReels((prev) => {
-              if (prev.some((r) => r.url === event.data!.url)) return prev;
+              const idx = prev.findIndex((r) => r.url === event.data!.url);
+              if (idx >= 0) {
+                // Update source_label in state — handles re-scrape after source delete+re-add
+                const next = [...prev];
+                next[idx] = { ...next[idx], source_label: event.data!.source_label };
+                return next;
+              }
               return [...prev, event.data!];
             });
-            addLog(`+ @${event.data.sender}`, "reel");
           }
           break;
 
@@ -202,21 +276,19 @@ export default function Home() {
           break;
 
         case "transcript_update":
-          if (event.id && event.transcript !== undefined) {
-            const id = event.id;
+          if (event.transcript !== undefined) {
+            const matchUrl = event.url;
+            const matchId = event.id;
             setReels((prev) =>
               prev.map((r) => {
-                const rid = new URL(r.url).pathname
-                  .split("/")
-                  .filter(Boolean)
-                  .pop();
-                if (rid === id) {
-                  setTranscribingUrls((s) => { const n = new Set(s); n.delete(r.url); return n; });
-                  return { ...r, transcript: event.transcript };
-                }
+                const hit = matchUrl
+                  ? r.url === matchUrl
+                  : new URL(r.url).pathname.split("/").filter(Boolean).pop() === matchId;
+                if (hit) return { ...r, transcript: event.transcript };
                 return r;
               })
             );
+            if (matchUrl) setTranscribingUrls((s) => { const n = new Set(s); n.delete(matchUrl); return n; });
           }
           break;
 
@@ -225,14 +297,17 @@ export default function Home() {
             setReels((prev) =>
               prev.map((r) => r.url === event.url ? { ...r, ...event.media } as Reel : r)
             );
+            setDownloadingUrls((prev) => { const s = new Set(prev); s.delete(event.url!); return s; });
           }
           break;
 
         case "done":
+          if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
           addLog(`✓ Done — ${event.count ?? 0} items`, "success");
           setStatus("idle");
           setSessionExists(true);
           setTranscribingUrls(new Set());
+          setDownloadProgress({ current: 0, total: 0 });
           if (jobStatus === "scraping" || jobStatus === "downloading") {
             fetchReels().then((r) => { if (r.length > 0) setReels(r); });
           }
@@ -246,11 +321,13 @@ export default function Home() {
     };
 
     ws.onerror = () => {
+      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
       addLog("✗ WebSocket error — check backend is running", "error");
       setStatus("idle");
     };
 
     ws.onclose = () => {
+      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
       if (status !== "idle") setStatus("idle");
     };
   }
@@ -306,6 +383,22 @@ export default function Home() {
     connectJob(res.job_id!, "transcripts");
   }
 
+  async function handleDownloadReel(url: string) {
+    setDownloadingUrls((prev) => new Set(prev).add(url));
+    try {
+      const res = await downloadVideo(url);
+      if (res.error) {
+        toast.error(res.error, { duration: 6000 });
+        setDownloadingUrls((prev) => { const s = new Set(prev); s.delete(url); return s; });
+      } else if (res.job_id) {
+        connectJob(res.job_id, "downloading");
+      }
+    } catch {
+      toast.error("Download failed — check backend connection");
+      setDownloadingUrls((prev) => { const s = new Set(prev); s.delete(url); return s; });
+    }
+  }
+
   function handleMediaReady(
     url: string,
     result: { video_path?: string; image_paths?: string[] }
@@ -318,34 +411,13 @@ export default function Home() {
     );
   }
 
-  function handleOnboardingStart(sources: Source[], downloadMedia: boolean) {
-    // Build StoredSource[] — auto-generate names for entries that left them blank
-    const dmSources = sources.filter((s) => s.type === "dm");
-    const n = dmSources.length;
-    let dmIdx = 0;
-    const stored: StoredSource[] = sources.map((s) => {
-      if (s.type === "dm") {
-        const defaultName = n === 1 ? "DM" : `DM ${dmIdx + 1}`;
-        dmIdx++;
-        return { ...s, name: s.name?.trim() || defaultName } as StoredSource;
-      } else {
-        return { ...s, name: s.name?.trim() || "Saved" } as StoredSource;
-      }
-    });
-    setConfiguredSources(stored);
-    saveStoredSources(stored);
-    localStorage.setItem("lo_sources_configured", "1");
-    setShowOnboarding(false);
-    handleScrape(sources, downloadMedia);
-  }
-
   function handleAddSource(source: StoredSource, downloadMedia: boolean) {
-    setConfiguredSources((prev) => {
-      const updated = [...prev, source];
-      saveStoredSources(updated);
-      return updated;
-    });
+    const updated = [...configuredSources, source];
+    setConfiguredSources(updated);
+    saveStoredSources(updated);
+    localStorage.setItem("lo_sources_configured", "1");
     setActiveSource(source.name);
+    setShowOnboarding(false);
     setShowAddSource(false);
     handleScrape([source], downloadMedia);
   }
@@ -353,9 +425,8 @@ export default function Home() {
   async function handleRescrapeSource(name: string, downloadMedia = false) {
     const source = configuredSources.find((s) => s.name === name);
     if (!source) return;
-    setReels((prev) => prev.filter((r) => r.source_label !== name));
-    addLog(`Re-scraping ${name}…`);
-    const res = await startScrape([{ ...source, fresh: true }], downloadMedia);
+    addLog(`Syncing latest for ${name}…`);
+    const res = await startScrape([source], downloadMedia);
     if (res.error) { addLog(`✗ ${res.error}`, "error"); return; }
     connectJob(res.job_id!, "scraping");
   }
@@ -367,13 +438,41 @@ export default function Home() {
     connectJob(res.job_id!, "downloading");
   }
 
-  function handleRemoveSource(name: string) {
-    setConfiguredSources((prev) => {
-      const updated = prev.filter((s) => s.name !== name);
-      saveStoredSources(updated);
-      if (activeSource === name) setActiveSource(updated[0]?.name ?? "");
-      return updated;
-    });
+  async function handleRunOnSelected(action: "download" | "captions" | "transcripts", urls: string[]) {
+    if (!urls.length) return;
+    if (action === "download") {
+      addLog(`Downloading media for ${urls.length} selected reel(s)…`);
+      const res = await startDownloadAll(undefined, urls);
+      if (res.error) { addLog(`✗ ${res.error}`, "error"); return; }
+      connectJob(res.job_id!, "downloading");
+    } else if (action === "captions") {
+      addLog(`Fetching captions for ${urls.length} selected reel(s)…`);
+      const res = await startCaptions(urls);
+      if (res.error) { addLog(`✗ ${res.error}`, "error"); return; }
+      connectJob(res.job_id!, "captions");
+    } else {
+      setTranscriptionProgress({ current: 0, total: 0 });
+      addLog(`Transcribing ${urls.length} selected reel(s)…`);
+      const res = await startTranscripts(urls);
+      if (res.error) { addLog(`✗ ${res.error}`, "error"); return; }
+      connectJob(res.job_id!, "transcripts");
+    }
+  }
+
+  async function handleRemoveSource(name: string) {
+    await deleteSource(name);
+    const remaining = configuredSources.filter((s) => s.name !== name);
+    saveStoredSources(remaining);
+    if (remaining.length === 0) {
+      setReels([]);
+      setActiveSource("");
+      localStorage.removeItem("lo_sources_configured");
+      setShowOnboarding(true);
+    } else {
+      setReels((prev) => prev.filter((r) => r.source_label !== name));
+      if (activeSource === name) setActiveSource(remaining[0].name);
+    }
+    setConfiguredSources(remaining);
   }
 
   const innerClass = fullWidth
@@ -448,14 +547,33 @@ export default function Home() {
               transcribingUrls={transcribingUrls}
               onCaptionFetch={handleCaptionRefetch}
               onTranscriptFetch={handleTranscriptRefetch}
+              onDownload={handleDownloadReel}
               onOpen={setVideoModal}
+              downloadingUrls={downloadingUrls}
+              noSources={configuredSources.length === 0}
+              onAddSource={() => setShowAddSource(true)}
+              onRunOnSelected={handleRunOnSelected}
             />
           </div>
         </div>
       </main>
 
       {/* Floating activity log */}
-      <ActivityLog lines={logs} isActive={isActive} />
+      <ActivityLog
+        lines={logs}
+        isActive={isActive}
+        progress={overallProgress}
+        statusLabel={
+          status === "downloading" && downloadProgress.total > 0
+            ? `Downloading ${downloadProgress.current}/${downloadProgress.total}…`
+            : undefined
+        }
+        onCancel={async () => {
+          await cancelJob();
+          setStatus("idle");
+          addLog("✗ Job cancelled", "error");
+        }}
+      />
 
       {/* Transcription progress bubble */}
       <TranscriptionBubble
@@ -464,19 +582,11 @@ export default function Home() {
         total={transcriptionProgress.total}
       />
 
-      {/* Onboarding dialog */}
-      {showOnboarding && (
-        <OnboardingDialog
-          onStart={handleOnboardingStart}
-          onClose={() => setShowOnboarding(false)}
-        />
-      )}
-
-      {/* Add source modal */}
-      {showAddSource && (
+      {/* Add source modal (also used as onboarding) */}
+      {(showOnboarding || showAddSource) && (
         <AddSourceModal
           onAdd={handleAddSource}
-          onClose={() => setShowAddSource(false)}
+          onClose={() => { setShowOnboarding(false); setShowAddSource(false); }}
           savedExists={configuredSources.some((s) => s.type === "saved")}
         />
       )}
@@ -490,21 +600,21 @@ export default function Home() {
           />
           <div className="relative bg-surface rounded-2xl shadow-modal w-full max-w-sm overflow-hidden">
             <div className="px-7 pt-7 pb-5 border-b border-border">
-              <h2 className="font-serif text-xl text-primary font-semibold mb-1">Re-scrape {rescrapeTarget}</h2>
-              <p className="text-muted text-sm">Would you also like to download the media files?</p>
+              <h2 className="font-serif text-xl text-primary font-semibold mb-1">Sync {rescrapeTarget}</h2>
+              <p className="text-muted text-sm">Fetch new reels added since last sync. Existing reels are kept. Download media too?</p>
             </div>
             <div className="px-7 py-5 flex flex-col gap-3">
               <button
                 className="w-full py-2.5 rounded-xl bg-accent text-white font-medium text-sm hover:bg-accent/90 transition-colors"
-                onClick={() => { const t = rescrapeTarget; setRescrapeTarget(null); handleRescrapeSource(t, true); }}
+                onClick={() => { const t = rescrapeTarget; setRescrapeTarget(null); handleRescrapeSource(t!, true); }}
               >
-                Re-scrape + Download media
+                Sync + Download new media
               </button>
               <button
                 className="w-full py-2.5 rounded-xl bg-black/10 text-primary font-medium text-sm hover:bg-black/15 transition-colors"
-                onClick={() => { const t = rescrapeTarget; setRescrapeTarget(null); handleRescrapeSource(t, false); }}
+                onClick={() => { const t = rescrapeTarget; setRescrapeTarget(null); handleRescrapeSource(t!, false); }}
               >
-                Re-scrape only
+                Sync only
               </button>
               <button
                 className="w-full py-2 text-muted text-sm hover:text-primary transition-colors"
@@ -526,6 +636,7 @@ export default function Home() {
           onMediaReady={handleMediaReady}
           onCaptionFetch={handleCaptionRefetch}
           onTranscriptFetch={handleTranscriptRefetch}
+          onDownload={handleDownloadReel}
         />
       )}
     </div>

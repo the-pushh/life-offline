@@ -202,6 +202,25 @@ def get_pending_transcripts() -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def count() -> int:
+    return _conn().execute("SELECT COUNT(*) FROM reels").fetchone()[0]
+
+
+def count_with_captions() -> int:
+    return _conn().execute("SELECT COUNT(*) FROM reels WHERE caption IS NOT NULL").fetchone()[0]
+
+
+def delete_by_source_label(source_label: str) -> list[dict]:
+    """Delete all reels for a source label. Returns deleted rows (for file cleanup)."""
+    rows = _conn().execute(
+        "SELECT * FROM reels WHERE source_label = ?", (source_label,)
+    ).fetchall()
+    deleted = [_row_to_dict(r) for r in rows]
+    _conn().execute("DELETE FROM reels WHERE source_label = ?", (source_label,))
+    _conn().commit()
+    return deleted
+
+
 def get_without_media(source_label: str | None = None) -> list[dict]:
     if source_label:
         rows = _conn().execute(

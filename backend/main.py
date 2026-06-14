@@ -1,9 +1,7 @@
 import asyncio
 import json
 import os
-import shutil
 from pathlib import Path
-from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -11,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from backend import db
 from backend.scraper import scrape_reels
 from backend.saved_posts import scrape_saved_posts
 from backend.enricher import (
@@ -26,6 +25,10 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(exist_ok=True)
 (DATA_DIR / "videos").mkdir(exist_ok=True)
 (DATA_DIR / "media").mkdir(exist_ok=True)
+(DATA_DIR / "audio").mkdir(exist_ok=True)
+(DATA_DIR / "transcripts").mkdir(exist_ok=True)
+
+db.init(DATA_DIR)
 
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 THREAD_URL_DEFAULT = os.getenv("THREAD_URL", "")
@@ -41,12 +44,13 @@ app.add_middleware(
 
 _jobs: dict[str, asyncio.Queue] = {}
 _current_job: str | None = None
+_current_task: asyncio.Task | None = None
 _download_lock = asyncio.Lock()
 
 
 class ScrapeRequest(BaseModel):
-    thread_url: str | None = None        # legacy single-DM format
-    sources: list[dict] | None = None    # new multi-source format
+    thread_url: str | None = None
+    sources: list[dict] | None = None
     download_media: bool = False
 
 
@@ -56,31 +60,11 @@ class SingleReelRequest(BaseModel):
 
 class DownloadAllRequest(BaseModel):
     source_label: str | None = None
+    urls: list[str] | None = None
 
 
-def _reel_id_from_url(url: str) -> str:
-    parts = [p for p in urlparse(url).path.split("/") if p]
-    return parts[-1] if parts else url[-12:]
-
-
-def _purge_reel_files(reels: list[dict], data_dir: Path) -> None:
-    videos_dir = data_dir / "videos"
-    audio_dir = data_dir / "audio"
-    transcripts_dir = data_dir / "transcripts"
-    for reel in reels:
-        reel_id = _reel_id_from_url(reel["url"])
-        media_dir = data_dir / "media" / reel_id
-        if media_dir.exists():
-            shutil.rmtree(media_dir, ignore_errors=True)
-        if videos_dir.exists():
-            for f in videos_dir.glob(f"{reel_id}.*"):
-                f.unlink(missing_ok=True)
-        if audio_dir.exists():
-            for f in audio_dir.glob(f"{reel_id}*.mp3"):
-                f.unlink(missing_ok=True)
-        if transcripts_dir.exists():
-            for f in transcripts_dir.glob(f"{reel_id}*.txt"):
-                f.unlink(missing_ok=True)
+class EnrichRequest(BaseModel):
+    urls: list[str] | None = None
 
 
 async def scrape_sources(
@@ -90,19 +74,15 @@ async def scrape_sources(
     on_event,
     download_media: bool = False,
 ) -> None:
-    reels_path = data_dir / "reels.json"
-    existing: list[dict] = json.loads(reels_path.read_text()) if reels_path.exists() else []
-    seen_urls: set[str] = {r["url"] for r in existing}
+    seen_urls: set[str] = db.get_urls()
     all_new: list[dict] = []
 
-    # Count each source type so we can produce distinct labels
     dm_sources = [s for s in sources if s.get("type", "dm") == "dm"]
     n_dm = len(dm_sources)
     dm_idx = 0
 
     for source in sources:
         stype = source.get("type", "dm")
-        fresh = bool(source.get("fresh", False))
 
         if stype == "dm":
             url = source.get("url", "").strip()
@@ -111,72 +91,70 @@ async def scrape_sources(
             default_label = "DM" if n_dm == 1 else f"DM {dm_idx + 1}"
             label = source.get("name", "").strip() or default_label
             dm_idx += 1
+            on_event({"type": "log", "msg": f"── {label}: {url[:60]}"})
+            new_reels = await scrape_reels(playwright, url, data_dir, on_event, source_label=label, known_urls=seen_urls)
         elif stype == "saved":
             username = source.get("username", "").strip().lstrip("@")
             if not username:
                 continue
             label = source.get("name", "").strip() or "Saved"
+            on_event({"type": "log", "msg": f"── Saved Posts: @{username}"})
+            new_reels = await scrape_saved_posts(
+                playwright, username, data_dir, on_event, source_label=label, known_urls=seen_urls
+            )
         else:
             continue
 
-        # Fresh re-scrape: purge existing reels for this source so they re-emit
-        if fresh:
-            to_purge = [r for r in existing if r.get("source_label") == label]
-            existing = [r for r in existing if r.get("source_label") != label]
-            seen_urls = {r["url"] for r in existing}
-            on_event({"type": "log", "msg": f"── {label}: clearing {len(to_purge)} old reels + media"})
-            _purge_reel_files(to_purge, data_dir)
-
-        if stype == "dm":
-            on_event({"type": "log", "msg": f"── {label}: {url[:60]}"})
-            new_reels = await scrape_reels(playwright, url, data_dir, on_event, source_label=label)
-        else:
-            on_event({"type": "log", "msg": f"── Saved Posts: @{username}"})
-            new_reels = await scrape_saved_posts(
-                playwright, username, data_dir, on_event, source_label=label
-            )
-
         for r in new_reels:
-            if r["url"] not in seen_urls:
-                seen_urls.add(r["url"])
+            is_new = r["url"] not in seen_urls
+            seen_urls.add(r["url"])
+            db.upsert(r)  # always upsert — ensures source_label is updated on re-scrape
+            if is_new:
                 all_new.append(r)
 
-    # Backfill source_label for any legacy reels missing the field
-    for r in existing:
-        if not r.get("source_label"):
-            r["source_label"] = "DM" if r.get("source") != "saved" else "Saved"
-
-    merged = existing + all_new
-    reels_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2))
-    (data_dir / "reel_links.txt").write_text("\n".join(r["url"] for r in merged))
-
-    # Optional: download media for all newly scraped reels
     if download_media and all_new:
-        on_event({"type": "log", "msg": f"Downloading media for {len(all_new)} reels..."})
+        n_dl = len(all_new)
+        on_event({"type": "log", "msg": f"── Media download — {n_dl} new reels"})
+        dl_ok = 0
         for i, reel in enumerate(all_new):
-            on_event({"type": "log", "msg": f"  [{i + 1}/{len(all_new)}] {reel['url'][-40:]}"})
+            on_event({"type": "log_replace", "replace_id": "dl_progress",
+                      "msg": f"[{i + 1}/{n_dl}] {reel['url'].split('/')[-2]}…"})
+            on_event({"type": "download_progress", "current": i + 1, "total": n_dl})
             result = await download_video_file(reel["url"], data_dir, on_event)
             if result:
-                reel.update(result)
                 on_event({"type": "reel_update", "url": reel["url"], "media": result})
-        reels_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2))
+                dl_ok += 1
+        on_event({"type": "log_replace", "replace_id": "dl_progress",
+                  "msg": f"✓ Media — {dl_ok}/{n_dl} downloaded"})
 
-    enriched = sum(1 for r in merged if r.get("caption"))
-    on_event({"type": "log", "msg": f"✓ All done — {len(all_new)} new reels ({len(merged)} total), {enriched} captions"})
+    total = db.count()
+    enriched = db.count_with_captions()
+    on_event({"type": "log", "msg": f"✓ All done — {len(all_new)} new reels ({total} total), {enriched} captions"})
     on_event({"type": "done", "stage": "scrape", "count": len(all_new)})
 
 
 async def _run_job(job_id: str, coro) -> None:
-    global _current_job
+    global _current_job, _current_task
     queue = _jobs[job_id]
     _current_job = job_id
     try:
         await coro(queue)
+    except asyncio.CancelledError:
+        queue.put_nowait({"type": "error", "msg": "Job cancelled"})
     except Exception as exc:
         queue.put_nowait({"type": "error", "msg": str(exc)})
     finally:
         queue.put_nowait(None)
         _current_job = None
+        _current_task = None
+
+
+def _start_job(coro_factory) -> str:
+    global _current_task
+    job_id = uuid4().hex[:8]
+    _jobs[job_id] = asyncio.Queue()
+    _current_task = asyncio.create_task(_run_job(job_id, coro_factory))
+    return job_id
 
 
 @app.post("/api/scrape")
@@ -191,45 +169,33 @@ async def start_scrape(req: ScrapeRequest):
     else:
         return JSONResponse({"error": "Provide thread_url or sources"}, status_code=400)
 
-    job_id = uuid4().hex[:8]
-    _jobs[job_id] = asyncio.Queue()
-
     async def run(q: asyncio.Queue):
         async with async_playwright() as pw:
             await scrape_sources(pw, sources, DATA_DIR, q.put_nowait, download_media=req.download_media)
 
-    asyncio.create_task(_run_job(job_id, run))
-    return {"job_id": job_id}
+    return {"job_id": _start_job(run)}
 
 
 @app.post("/api/enrich/captions")
-async def start_captions():
+async def start_captions(req: EnrichRequest = EnrichRequest()):
     if _current_job:
         return JSONResponse({"error": "A job is already running"}, status_code=409)
 
-    job_id = uuid4().hex[:8]
-    _jobs[job_id] = asyncio.Queue()
-
     async def run(q: asyncio.Queue):
-        await enrich_captions(DATA_DIR, q.put_nowait)
+        await enrich_captions(DATA_DIR, q.put_nowait, url_filter=req.urls)
 
-    asyncio.create_task(_run_job(job_id, run))
-    return {"job_id": job_id}
+    return {"job_id": _start_job(run)}
 
 
 @app.post("/api/enrich/transcripts")
-async def start_transcripts():
+async def start_transcripts(req: EnrichRequest = EnrichRequest()):
     if _current_job:
         return JSONResponse({"error": "A job is already running"}, status_code=409)
 
-    job_id = uuid4().hex[:8]
-    _jobs[job_id] = asyncio.Queue()
-
     async def run(q: asyncio.Queue):
-        await enrich_transcripts(DATA_DIR, WHISPER_DEVICE, q.put_nowait)
+        await enrich_transcripts(DATA_DIR, WHISPER_DEVICE, q.put_nowait, url_filter=req.urls)
 
-    asyncio.create_task(_run_job(job_id, run))
-    return {"job_id": job_id}
+    return {"job_id": _start_job(run)}
 
 
 @app.post("/api/enrich/download-all")
@@ -237,30 +203,44 @@ async def start_download_all(req: DownloadAllRequest):
     if _current_job:
         return JSONResponse({"error": "A job is already running"}, status_code=409)
 
-    job_id = uuid4().hex[:8]
-    _jobs[job_id] = asyncio.Queue()
-
     async def run(q: asyncio.Queue):
-        reels_path = DATA_DIR / "reels.json"
-        if not reels_path.exists():
+        from urllib.parse import urlparse
+        def _sid(url: str) -> str:
+            parts = [p for p in urlparse(url).path.split("/") if p]
+            return parts[-1] if parts else url[-12:]
+
+        if req.urls:
+            all_reels = db.get_all()
+            url_set = set(req.urls)
+            targets = [r for r in all_reels if r["url"] in url_set]
+        else:
+            targets = db.get_without_media(req.source_label)
+        total = len(targets)
+        if not targets:
+            q.put_nowait({"type": "log", "msg": "↩ all media already downloaded"})
             q.put_nowait({"type": "done", "count": 0})
             return
-        reels = json.loads(reels_path.read_text())
-        targets = [
-            r for r in reels
-            if (not req.source_label or r.get("source_label") == req.source_label)
-            and not r.get("video_path") and not r.get("image_paths")
-        ]
+
+        label = f" ({req.source_label})" if req.source_label else ""
+        q.put_nowait({"type": "log", "msg": f"── Media download{label} — {total} pending"})
         count = 0
-        for reel in targets:
+        failed = 0
+        for i, reel in enumerate(targets):
+            sid = _sid(reel["url"])
+            q.put_nowait({"type": "log_replace", "replace_id": "dl_progress",
+                          "msg": f"[{i + 1}/{total}] {sid}…"})
+            q.put_nowait({"type": "download_progress", "current": i + 1, "total": total})
             result = await download_video_file(reel["url"], DATA_DIR, q.put_nowait)
             if result:
                 q.put_nowait({"type": "reel_update", "url": reel["url"], "media": result})
                 count += 1
+            else:
+                failed += 1
+        q.put_nowait({"type": "log_replace", "replace_id": "dl_progress",
+                      "msg": f"✓ Media — {count}/{total} downloaded" + (f", {failed} failed" if failed else "")})
         q.put_nowait({"type": "done", "count": count})
 
-    asyncio.create_task(_run_job(job_id, run))
-    return {"job_id": job_id}
+    return {"job_id": _start_job(run)}
 
 
 @app.post("/api/reel/caption")
@@ -268,14 +248,10 @@ async def reel_caption(req: SingleReelRequest):
     if _current_job:
         return JSONResponse({"error": "A job is already running"}, status_code=409)
 
-    job_id = uuid4().hex[:8]
-    _jobs[job_id] = asyncio.Queue()
-
     async def run(q: asyncio.Queue):
         await enrich_one_caption(req.url, DATA_DIR, q.put_nowait)
 
-    asyncio.create_task(_run_job(job_id, run))
-    return {"job_id": job_id}
+    return {"job_id": _start_job(run)}
 
 
 @app.post("/api/reel/transcript")
@@ -283,38 +259,45 @@ async def reel_transcript(req: SingleReelRequest):
     if _current_job:
         return JSONResponse({"error": "A job is already running"}, status_code=409)
 
-    job_id = uuid4().hex[:8]
-    _jobs[job_id] = asyncio.Queue()
-
     async def run(q: asyncio.Queue):
         await enrich_one_transcript(req.url, DATA_DIR, WHISPER_DEVICE, q.put_nowait)
 
-    asyncio.create_task(_run_job(job_id, run))
-    return {"job_id": job_id}
+    return {"job_id": _start_job(run)}
+
+
+@app.post("/api/job/cancel")
+async def cancel_job():
+    global _current_task
+    if _current_task and not _current_task.done():
+        _current_task.cancel()
+        return {"cancelled": True}
+    return {"cancelled": False}
 
 
 @app.post("/api/reel/download")
 async def reel_download(req: SingleReelRequest):
-    """Download reel media with yt-dlp. Returns {video_path?, image_paths?, post_type} or error."""
-    async with _download_lock:
-        events: list[dict] = []
-        def collect(e):
-            events.append(e)
+    if _current_job:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
 
-        result = await download_video_file(req.url, DATA_DIR, collect)
-        log = [e.get("msg", "") for e in events]
+    async def run(q: asyncio.Queue):
+        q.put_nowait({"type": "download_progress", "current": 0, "total": 1})
+        result = await download_video_file(req.url, DATA_DIR, q.put_nowait)
         if result:
-            return {**result, "log": log}
-        return JSONResponse({"error": "Download failed", "log": log}, status_code=500)
+            q.put_nowait({"type": "download_progress", "current": 1, "total": 1})
+            q.put_nowait({"type": "reel_update", "url": req.url, "media": result})
+            q.put_nowait({"type": "done", "count": 1})
+        else:
+            q.put_nowait({"type": "error", "msg": "Download failed"})
+            q.put_nowait({"type": "done", "count": 0})
+
+    return {"job_id": _start_job(run)}
 
 
 @app.get("/api/videos/{reel_id}")
 async def serve_video(reel_id: str):
-    # Check legacy videos dir
     candidates = list((DATA_DIR / "videos").glob(f"{reel_id}.*"))
     if candidates:
         return FileResponse(candidates[0], media_type="video/mp4")
-    # Check new media dir
     media_dir = DATA_DIR / "media" / reel_id
     if media_dir.exists():
         vids = sorted(media_dir.glob("*.mp4"))
@@ -337,24 +320,14 @@ async def serve_media_file(reel_id: str, filename: str):
 
 @app.get("/api/reels")
 async def get_reels():
-    reels_path = DATA_DIR / "reels.json"
-    if not reels_path.exists():
-        return []
-    return json.loads(reels_path.read_text())
+    return db.get_all()
 
 
 @app.get("/api/status")
 async def get_status():
-    reels_path = DATA_DIR / "reels.json"
-    count = 0
-    if reels_path.exists():
-        try:
-            count = len(json.loads(reels_path.read_text()))
-        except Exception:
-            pass
     return {
         "session_exists": (DATA_DIR / "session.json").exists(),
-        "reels_count": count,
+        "reels_count": db.count(),
         "current_job": _current_job,
         "default_thread_url": THREAD_URL_DEFAULT,
     }
@@ -368,20 +341,59 @@ async def clear_session():
     return {"cleared": True}
 
 
+@app.delete("/api/source/{source_label}")
+async def delete_source(source_label: str):
+    import shutil
+    deleted = db.delete_by_source_label(source_label)
+    removed_files = 0
+    for reel in deleted:
+        shortcode = reel.get("shortcode") or ""
+        if reel.get("video_path"):
+            p = DATA_DIR / reel["video_path"]
+            if p.exists():
+                p.unlink()
+                removed_files += 1
+        if reel.get("image_paths"):
+            for rel in reel["image_paths"]:
+                p = DATA_DIR / rel
+                if p.exists():
+                    p.unlink()
+                    removed_files += 1
+        # Remove media directory for this reel
+        if shortcode:
+            media_dir = DATA_DIR / "media" / shortcode
+            if media_dir.exists():
+                shutil.rmtree(media_dir)
+                removed_files += 1
+            # Remove audio file(s)
+            for mp3 in (DATA_DIR / "audio").glob(f"{shortcode}*.mp3"):
+                mp3.unlink()
+                removed_files += 1
+    return {"deleted_reels": len(deleted), "removed_files": removed_files}
+
+
 @app.get("/api/export/links")
 async def export_links():
-    p = DATA_DIR / "reel_links.txt"
-    if not p.exists():
-        return JSONResponse({"error": "No links yet — scrape first"}, status_code=404)
-    return FileResponse(p, filename="reel_links.txt", media_type="text/plain")
+    reels = db.get_all()
+    if not reels:
+        return JSONResponse({"error": "No reels yet — scrape first"}, status_code=404)
+    content = "\n".join(r["url"] for r in reels)
+    from fastapi.responses import Response
+    return Response(content=content, media_type="text/plain",
+                    headers={"Content-Disposition": "attachment; filename=reel_links.txt"})
 
 
 @app.get("/api/export/json")
 async def export_json():
-    p = DATA_DIR / "reels.json"
-    if not p.exists():
+    reels = db.get_all()
+    if not reels:
         return JSONResponse({"error": "No reels yet — scrape first"}, status_code=404)
-    return FileResponse(p, filename="reels.json", media_type="application/json")
+    from fastapi.responses import Response
+    return Response(
+        content=json.dumps(reels, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=reels.json"},
+    )
 
 
 @app.websocket("/ws/{job_id}")
