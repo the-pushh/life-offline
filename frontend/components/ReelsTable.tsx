@@ -82,6 +82,7 @@ export default function ReelsTable({
   function clearSelection() { setSelected(new Set()); }
 
   const selectionUrls = [...selected];
+  const selectionHasVideo = selectionUrls.some((u) => reels.find((r) => r.url === u)?.video_path);
 
   return (
     <div className="bg-surface flex flex-col flex-1 min-h-0 overflow-hidden">
@@ -140,8 +141,9 @@ export default function ReelsTable({
                 </button>
                 <button
                   onClick={() => { onRunOnSelected("transcripts", selectionUrls); clearSelection(); }}
-                  disabled={busy}
-                  className="text-xs px-2.5 py-1 rounded-lg bg-surface border border-border text-muted hover:border-accent hover:text-accent disabled:opacity-40 transition-colors font-medium"
+                  disabled={busy || !selectionHasVideo}
+                  title={!selectionHasVideo ? "Download media first to enable transcription" : undefined}
+                  className="text-xs px-2.5 py-1 rounded-lg bg-surface border border-border text-muted hover:border-accent hover:text-accent disabled:opacity-40 disabled:cursor-not-allowed transition-colors font-medium"
                 >
                   Transcripts
                 </button>
@@ -297,11 +299,13 @@ export default function ReelsTable({
                           if (isImageOnly) return <span className="text-xs text-muted-2">—</span>;
                           if (reel.transcript) return <CopyButton text={reel.transcript} />;
                           if (transcribingUrls.has(reel.url)) return <TranscribingIndicator />;
+                          const hasVideo = !!reel.video_path;
                           return (
                             <button
-                              onClick={(e) => { e.stopPropagation(); onTranscriptFetch(reel.url); }}
-                              disabled={busy}
-                              className="text-xs px-2 py-0.5 rounded-md border border-border text-muted hover:border-accent hover:text-accent disabled:opacity-30 transition-colors"
+                              onClick={(e) => { e.stopPropagation(); if (hasVideo) onTranscriptFetch(reel.url); }}
+                              disabled={busy || !hasVideo}
+                              title={!hasVideo ? "Download media first to enable transcription" : undefined}
+                              className="text-xs px-2 py-0.5 rounded-md border border-border text-muted hover:border-accent hover:text-accent disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                             >
                               Transcribe
                             </button>
