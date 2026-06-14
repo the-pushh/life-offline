@@ -205,11 +205,11 @@ export default function Home() {
     const resetStall = () => {
       if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
       stallTimerRef.current = setTimeout(async () => {
-        addLog("⚠ No activity for 90s — job stalled (computer may have slept). Cancelling. Re-run to resume from where it left off.", "error");
+        addLog("⚠ No activity for 5 minutes — job stalled (computer may have slept). Cancelling. Re-run download to continue from where it left off.", "error");
         await cancelJob();
         setStatus("idle");
         setDownloadProgress({ current: 0, total: 0 });
-      }, 90_000);
+      }, 300_000);
     };
     resetStall();
 

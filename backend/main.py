@@ -119,6 +119,7 @@ async def scrape_sources(
         for i, reel in enumerate(all_new):
             on_event({"type": "log_replace", "replace_id": "dl_progress",
                       "msg": f"[{i + 1}/{n_dl}] {reel['url'].split('/')[-2]}…"})
+            on_event({"type": "download_progress", "current": i + 1, "total": n_dl})
             result = await download_video_file(reel["url"], data_dir, on_event)
             if result:
                 on_event({"type": "reel_update", "url": reel["url"], "media": result})

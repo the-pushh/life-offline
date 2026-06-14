@@ -166,7 +166,7 @@ function Tab({
         {menuOpen && (
           <div className="absolute top-full left-0 z-50 mt-1.5 bg-surface rounded-xl shadow-modal border border-border py-1 min-w-[195px]">
             <MenuItem onClick={() => { setMenuOpen(false); onRescrape(); }}>
-              ↺ Re-run scraping
+              ↺ Sync latest
             </MenuItem>
             <MenuItem onClick={() => { setMenuOpen(false); onDownloadMedia(); }}>
               ↓ Download all media

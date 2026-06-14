@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,60 +20,97 @@ def _get_whisper(model_size: str, device: str, compute_type: str):
     return _whisper_cache[key]
 
 
+_SHORTCODE_RE = re.compile(r'^[A-Za-z0-9_\-]{6,}$')
+
 def _reel_id(url: str) -> str:
     parts = [p for p in urlparse(url).path.split("/") if p]
-    return parts[-1] if parts else url[-12:]
+    candidate = parts[-1] if parts else ""
+    return candidate if _SHORTCODE_RE.match(candidate) else ""
 
 
 async def _download_via_instaloader(
     url: str, reel_id: str, media_dir: Path, data_dir: Path, on_event
 ) -> dict | None:
+    if not reel_id:
+        on_event({"type": "log", "msg": f"✗ cannot extract shortcode from URL: {url}"})
+        return None
+
     import instaloader
 
-    L = instaloader.Instaloader(
-        download_pictures=True,
-        download_videos=True,
-        download_video_thumbnails=False,
-        save_metadata=False,
-        post_metadata_txt_pattern="",
-        compress_json=False,
-        quiet=True,
-    )
+    def _make_loader(with_session: bool = False) -> "instaloader.Instaloader":
+        L = instaloader.Instaloader(
+            download_pictures=True,
+            download_videos=True,
+            download_video_thumbnails=True,
+            save_metadata=False,
+            post_metadata_txt_pattern="",
+            compress_json=False,
+            quiet=True,
+        )
+        if with_session:
+            session_file = data_dir / "session.json"
+            if session_file.exists():
+                try:
+                    state = json.loads(session_file.read_text())
+                    ig_cookies = {c["name"]: c["value"]
+                                  for c in state.get("cookies", [])
+                                  if "instagram.com" in c.get("domain", "")}
+                    if ig_cookies:
+                        L.context._session.cookies.update(ig_cookies)
+                except Exception:
+                    pass
+        return L
 
-    session_path = data_dir / "session.json"
-    if session_path.exists():
-        try:
-            state = json.loads(session_path.read_text())
-            ig_cookies = {c["name"]: c["value"]
-                          for c in state.get("cookies", [])
-                          if "instagram.com" in c.get("domain", "")}
-            if ig_cookies:
-                L.context._session.cookies.update(ig_cookies)
-        except Exception:
-            pass
-
-    def _do_download() -> list[Path]:
-        post = instaloader.Post.from_shortcode(L.context, reel_id)
-        L.download_post(post, target=media_dir)
+    def _do_download(L) -> list[Path]:
+        import contextlib, os
+        with open(os.devnull, "w") as _null:
+            with contextlib.redirect_stderr(_null):
+                post = instaloader.Post.from_shortcode(L.context, reel_id)
+                L.download_post(post, target=media_dir)
         return sorted(f for f in media_dir.glob("*")
                       if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".mp4"))
 
-    max_retries = 10
     files = None
-    for attempt in range(1, max_retries + 1):
+
+    # ── Phase 1: anonymous (3 attempts, 5s between) ───────────────────────────
+    L_anon = _make_loader(with_session=False)
+    anon_ok = False
+    for attempt in range(1, 4):
         try:
-            on_event({"type": "log", "msg": f"instaloader → {reel_id}… (attempt {attempt}/{max_retries})"})
-            files = await asyncio.get_event_loop().run_in_executor(None, _do_download)
+            on_event({"type": "log", "msg": f"instaloader → {reel_id}… (attempt {attempt}/3)"})
+            files = await asyncio.get_event_loop().run_in_executor(None, lambda: _do_download(L_anon))
+            anon_ok = True
             break
         except Exception as exc:
             msg = str(exc)
-            if attempt < max_retries:
-                wait = min(5 * attempt, 60)
-                on_event({"type": "log", "msg": f"  ✗ attempt {attempt}: {msg[:120]} — retry in {wait}s"})
-                await asyncio.sleep(wait)
+            if attempt < 3:
+                on_event({"type": "log", "msg": f"  ✗ attempt {attempt}: {msg[:120]} — retry in 5s"})
+                await asyncio.sleep(5)
             else:
-                on_event({"type": "log", "msg": f"  ✗ all {max_retries} attempts failed: {msg[:120]}"})
-                return None
+                on_event({"type": "log", "msg": f"  ✗ anonymous failed: {msg[:120]} — trying with session…"})
+
+    # ── Phase 2: authenticated fallback (2 attempts, 5s between) ─────────────
+    if not anon_ok:
+        session_file = data_dir / "session.json"
+        if not session_file.exists():
+            on_event({"type": "log", "msg": "  ✗ no saved session — run scrape to log in first"})
+            return None
+
+        L_auth = _make_loader(with_session=True)
+        for attempt in range(1, 3):
+            try:
+                on_event({"type": "log", "msg": f"  ↻ session attempt {attempt}/2…"})
+                files = await asyncio.get_event_loop().run_in_executor(None, lambda: _do_download(L_auth))
+                on_event({"type": "log", "msg": f"  ✓ downloaded via session"})
+                break
+            except Exception as exc:
+                msg = str(exc)
+                if attempt < 2:
+                    on_event({"type": "log", "msg": f"  ✗ session attempt {attempt}: {msg[:120]} — retry in 5s"})
+                    await asyncio.sleep(5)
+                else:
+                    on_event({"type": "log", "msg": f"  ✗ session failed: {msg[:120]}"})
+                    return None
 
     if not files:
         on_event({"type": "log", "msg": "✗ instaloader: no files downloaded"})
@@ -81,15 +119,24 @@ async def _download_via_instaloader(
     videos = [f for f in files if f.suffix.lower() == ".mp4"]
     images = [f for f in files if f.suffix.lower() != ".mp4"]
 
-    if videos and not images:
-        rel = f"media/{reel_id}/{videos[0].name}"
+    if videos:
+        # Video post — any jpg alongside it is the cover thumbnail
+        video_rel = f"media/{reel_id}/{videos[0].name}"
+        thumb = f"media/{reel_id}/{images[0].name}" if images else None
         on_event({"type": "log", "msg": f"✓ video: {videos[0].name}"})
-        return {"video_path": rel, "post_type": "video"}
+        result: dict = {"video_path": video_rel, "post_type": "video"}
+        if thumb:
+            result["thumbnail"] = thumb
+        return result
 
-    rels = [f"media/{reel_id}/{f.name}" for f in (images or files)]
+    rels = [f"media/{reel_id}/{f.name}" for f in images]
     post_type = "carousel_image" if len(rels) > 1 else "image"
+    thumb = f"media/{reel_id}/{images[0].name}" if images else None
     on_event({"type": "log", "msg": f"✓ {len(rels)} image(s) saved"})
-    return {"image_paths": rels, "post_type": post_type}
+    result = {"image_paths": rels, "post_type": post_type}
+    if thumb:
+        result["thumbnail"] = thumb
+    return result
 
 
 async def enrich_captions(data_dir: Path, on_event, url_filter: list[str] | None = None) -> None:
@@ -168,52 +215,53 @@ async def enrich_transcripts(data_dir: Path, whisper_device: str, on_event, url_
         on_event({"type": "done", "stage": "transcripts", "count": 0})
         return
 
-    pending_urls = [r["url"] for r in pending]
-    total = len(pending_urls)
+    total = len(pending)
     on_event({"type": "transcription_start", "total": total})
     on_event({"type": "log", "msg": f"── Transcripts — {total} pending"})
 
-    # Stage 1: audio download (parallel, semaphore=3)
-    on_event({"type": "log", "msg": f"Stage 1/2 — audio download ({total} reels, parallel)"})
-    sem = asyncio.Semaphore(3)
-    dl_done = 0
-    dl_skip = 0
-    dl_errors: list[str] = []
+    # Stage 1: extract audio from local video files via ffmpeg
+    on_event({"type": "log", "msg": f"Stage 1/2 — extracting audio ({total} reels)"})
+    ext_done = 0
+    ext_skip = 0
 
-    async def _download_one(url: str) -> None:
-        nonlocal dl_done, dl_skip
-        reel_id = _reel_id(url)
-        if list(audio_dir.glob(f"{reel_id}*.mp3")):
-            dl_skip += 1
+    for i, reel in enumerate(pending):
+        reel_id = _reel_id(reel["url"])
+        mp3_path = audio_dir / f"{reel_id}.mp3"
+
+        if mp3_path.exists():
             on_event({"type": "log_replace", "replace_id": "audio_progress",
-                      "msg": f"↩ [{dl_done + dl_skip}/{total}] {reel_id} — audio cached"})
-            return
-        async with sem:
-            on_event({"type": "log_group_start", "label": f"[{dl_done + dl_skip + 1}/{total}] audio {reel_id}…"})
+                      "msg": f"↩ [{i + 1}/{total}] {reel_id} — audio cached"})
+            ext_done += 1
+            continue
+
+        video_path = reel.get("video_path")
+        if not video_path or not (data_dir / video_path).exists():
+            on_event({"type": "log_replace", "replace_id": "audio_progress",
+                      "msg": f"✗ [{i + 1}/{total}] {reel_id} — no local video, download media first"})
+            ext_skip += 1
+            continue
+
+        on_event({"type": "log_replace", "replace_id": "audio_progress",
+                  "msg": f"[{i + 1}/{total}] extracting audio {reel_id}…"})
+        try:
             proc = await asyncio.create_subprocess_exec(
-                "yt-dlp", url,
-                "-x", "--audio-format", "mp3",
-                "-o", str(audio_dir / "%(id)s.%(ext)s"),
-                "--no-playlist", "--ignore-errors",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                "ffmpeg", "-i", str(data_dir / video_path), "-vn", "-acodec", "mp3", "-y", str(mp3_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            async for raw in proc.stdout:
-                on_event({"type": "log", "msg": raw.decode().rstrip()})
-            rc = await proc.wait()
-            on_event({"type": "log_group_end", "success": rc == 0})
-            if rc != 0:
-                dl_errors.append(reel_id)
+            await proc.wait()
+            if mp3_path.exists():
+                ext_done += 1
             else:
-                dl_done += 1
-            on_event({"type": "log_replace", "replace_id": "audio_progress",
-                      "msg": f"[{dl_done + dl_skip}/{total}] audio downloaded"})
+                ext_skip += 1
+        except FileNotFoundError:
+            on_event({"type": "error", "msg": "ffmpeg not found — install ffmpeg to enable transcripts"})
+            on_event({"type": "done", "stage": "transcripts", "count": 0})
+            return
 
-    await asyncio.gather(*[_download_one(u) for u in pending_urls])
-
-    summary = f"✓ Audio — {dl_done} downloaded, {dl_skip} cached"
-    if dl_errors:
-        summary += f", {len(dl_errors)} failed"
+    summary = f"✓ Audio — {ext_done} ready"
+    if ext_skip:
+        summary += f", {ext_skip} skipped (download media first)"
     on_event({"type": "log_replace", "replace_id": "audio_progress", "msg": summary})
 
     try:
@@ -226,6 +274,7 @@ async def enrich_transcripts(data_dir: Path, whisper_device: str, on_event, url_
     compute_type = "float16" if whisper_device == "cuda" else "int8"
     model = _get_whisper("base", whisper_device, compute_type)
 
+    pending_urls = [r["url"] for r in pending]
     available = [(url, list(audio_dir.glob(f"{_reel_id(url)}*.mp3"))) for url in pending_urls]
     available = [(url, mp3s) for url, mp3s in available if mp3s]
     n_avail = len(available)
@@ -312,37 +361,13 @@ async def enrich_one_transcript(url: str, data_dir: Path, whisper_device: str, o
                     )
                     await proc.wait()
                 except FileNotFoundError:
-                    on_event({"type": "log", "msg": "  ffmpeg not found — falling back to yt-dlp"})
-
-    ytdlp_log: list[str] = []
-    if not mp3_path.exists():
-        on_event({"type": "log_group_start", "label": f"Downloading audio for {reel_id} via yt-dlp…"})
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", url,
-            "-x", "--audio-format", "mp3",
-            "-o", str(audio_dir / "%(id)s.%(ext)s"),
-            "--no-playlist", "--ignore-errors",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        async for line in proc.stdout:
-            decoded = line.decode().rstrip()
-            ytdlp_log.append(decoded)
-            on_event({"type": "log", "msg": decoded})
-        rc = await proc.wait()
-        on_event({"type": "log_group_end", "success": rc == 0})
+                    on_event({"type": "error", "msg": "ffmpeg not found — install ffmpeg to enable transcripts"})
+                    on_event({"type": "done", "stage": "transcripts", "count": 0})
+                    return
 
     mp3_files = list(audio_dir.glob(f"{reel_id}*.mp3"))
     if not mp3_files:
-        joined = " ".join(ytdlp_log)
-        if "429" in joined:
-            on_event({"type": "error", "msg": "Instagram rate-limited yt-dlp (429) — wait a few minutes and retry."})
-        elif "login" in joined.lower() or "private" in joined.lower():
-            on_event({"type": "error", "msg": "Reel is private or requires login — audio unavailable."})
-        elif ytdlp_log:
-            on_event({"type": "error", "msg": "yt-dlp failed — reel may be deleted or unsupported."})
-        else:
-            on_event({"type": "error", "msg": f"No audio source found for {reel_id} — no local video and yt-dlp unavailable."})
+        on_event({"type": "error", "msg": f"No audio for {reel_id} — download media first, then retry transcripts."})
         on_event({"type": "done", "stage": "transcripts", "count": 0})
         return
 
@@ -379,12 +404,19 @@ async def download_video_file(url: str, data_dir: Path, on_event) -> dict | None
             p = data_dir / cached["video_path"]
             if p.exists():
                 on_event({"type": "log", "msg": f"↩ already in cache — {cached['video_path']}"})
-                return {"video_path": cached["video_path"], "post_type": cached.get("post_type", "video")}
+                result: dict = {"video_path": cached["video_path"], "post_type": cached.get("post_type", "video")}
+                if cached.get("thumbnail"):
+                    result["thumbnail"] = cached["thumbnail"]
+                return result
         if cached.get("image_paths"):
             paths = cached["image_paths"]
             if isinstance(paths, list) and all((data_dir / p).exists() for p in paths):
                 on_event({"type": "log", "msg": f"↩ already in cache — {len(paths)} image(s)"})
-                return {"image_paths": paths, "post_type": cached.get("post_type", "carousel_image")}
+                thumb = cached.get("thumbnail") or (paths[0] if paths else None)
+                result = {"image_paths": paths, "post_type": cached.get("post_type", "carousel_image")}
+                if thumb:
+                    result["thumbnail"] = thumb
+                return result
 
     # Filesystem fallback for files not yet in DB
     existing = sorted(media_dir.glob("*.*"))

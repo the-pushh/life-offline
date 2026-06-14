@@ -4,5 +4,4 @@ httpx
 playwright
 python-dotenv
 faster-whisper
-yt-dlp
 instaloader

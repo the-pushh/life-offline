@@ -59,7 +59,7 @@ export interface WsEvent {
   caption?: string;
   id?: string;
   transcript?: string;
-  media?: { video_path?: string; image_paths?: string[]; post_type?: string };
+  media?: { video_path?: string; image_paths?: string[]; post_type?: string; thumbnail?: string };
   stage?: "scrape" | "captions" | "transcripts";
   count?: number;
 }

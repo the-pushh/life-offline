@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import type { Reel } from "@/lib/api";
+import { mediaFileUrl } from "@/lib/api";
 
 type Status = "idle" | "scraping" | "captions" | "transcripts" | "downloading";
 type Filter = "all" | "no_media" | "no_caption" | "no_transcript";
@@ -206,9 +207,14 @@ export default function ReelsTable({
                       <td className="px-3 py-3">
                         {(() => {
                           const hasMedia = !!(reel.video_path || reel.image_paths?.length);
-                          const hasThumbnail = !!reel.thumbnail;
+                          const rawThumb = reel.thumbnail || (reel.image_paths?.[0] ?? null);
+                          const thumbSrc = rawThumb
+                            ? rawThumb.startsWith("http")
+                              ? rawThumb
+                              : mediaFileUrl(rawThumb)
+                            : null;
                           const btnBase = "w-10 h-10 flex-shrink-0 rounded-lg border border-border hover:border-accent hover:scale-105 transition-transform";
-                          if (hasMedia && hasThumbnail) {
+                          if (hasMedia && thumbSrc) {
                             return (
                               <button
                                 onClick={(e) => { e.stopPropagation(); onOpen(reel); }}
@@ -216,7 +222,7 @@ export default function ReelsTable({
                                 className={`relative overflow-hidden hover:text-accent text-white ${btnBase}`}
                               >
                                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                                <img src={reel.thumbnail} alt={reel.sender} className="w-full h-full object-cover" onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                                <img src={thumbSrc} alt={reel.sender} className="w-full h-full object-cover" onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
                                 <span className="absolute inset-0 flex items-center justify-center bg-black/25">
                                   <svg width="15" height="15" viewBox="0 0 8 8" fill="currentColor" className="drop-shadow">
                                     <path d="M1.5 1.5l5 2.5-5 2.5V1.5z" />

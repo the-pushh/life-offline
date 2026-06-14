@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.async_api import Playwright
+from backend import db
 
 
 def _clean_url(url: str) -> str:
@@ -72,8 +73,8 @@ def extract_reels_from_response(data: dict) -> list[dict]:
     for edge in messages_node.get("edges", []):
         node = edge.get("node", {})
         xma = node.get("xma") or (node.get("content") or {}).get("xma") or {}
-        target_url = xma.get("target_url") or xma.get("url") or ""
-        if not target_url:
+        target_url = _clean_url(xma.get("target_url") or xma.get("url") or "")
+        if not target_url or "instagram.com" not in target_url:
             continue
 
         preview = xma.get("preview_image") or xma.get("xmaPreviewImage") or {}
@@ -119,13 +120,22 @@ async def login_and_save_session(playwright: Playwright, data_dir: Path, on_even
     await browser.close()
 
 
-async def scrape_reels(playwright: Playwright, thread_url: str, data_dir: Path, on_event, source_label: str = "DM") -> list[dict]:
+async def scrape_reels(
+    playwright: Playwright,
+    thread_url: str,
+    data_dir: Path,
+    on_event,
+    source_label: str = "DM",
+    known_urls: set[str] | None = None,
+) -> list[dict]:
     session_file = data_dir / "session.json"
     if not session_file.exists():
         await login_and_save_session(playwright, data_dir, on_event)
 
+    known_urls = known_urls or set()
     all_reels: list[dict] = []
     seen_urls: set[str] = set()
+    n_done = 0
 
     browser = await playwright.chromium.launch(headless=False)
     context = await browser.new_context(
@@ -135,27 +145,41 @@ async def scrape_reels(playwright: Playwright, thread_url: str, data_dir: Path, 
 
     # Caption worker: separate page, runs concurrently with scroll loop
     caption_queue: asyncio.Queue = asyncio.Queue()
-
     anon_context = await browser.new_context()
 
     async def caption_worker() -> None:
+        nonlocal n_done
         cap_page = await anon_context.new_page()
         while True:
             reel = await caption_queue.get()
             if reel is None:
                 break
             try:
+                cached = db.get_by_url(reel["url"])
+                if cached and cached.get("caption"):
+                    reel["caption"] = cached["caption"]
+                    on_event({"type": "caption_update", "url": reel["url"], "caption": cached["caption"]})
+                    n_done += 1
+                    on_event({"type": "log_replace", "replace_id": "cap_progress",
+                              "msg": f"↩ [{n_done}/{len(all_reels)}] caption from cache"})
+                    continue
+
                 await asyncio.sleep(random.uniform(2.5, 4.5))
                 await cap_page.goto(_caption_url(reel["url"]), wait_until="domcontentloaded", timeout=15_000)
-                landed = cap_page.url
-                content = await cap_page.content()
-                caption = _extract_caption(content)
-                on_event({"type": "log", "msg": f"  cap {landed[:60]} → {'✓' if caption else f'✗ no og:desc (len={len(content)})'}"})
+                caption = _extract_caption(await cap_page.content())
+                n_done += 1
                 if caption:
                     reel["caption"] = caption
                     on_event({"type": "caption_update", "url": reel["url"], "caption": caption})
+                    on_event({"type": "log_replace", "replace_id": "cap_progress",
+                              "msg": f"  [{n_done}/{len(all_reels)}] ✓ caption fetched"})
+                else:
+                    on_event({"type": "log_replace", "replace_id": "cap_progress",
+                              "msg": f"  [{n_done}/{len(all_reels)}] ✗ no caption found"})
             except Exception as exc:
-                on_event({"type": "log", "msg": f"  cap err: {exc}"})
+                n_done += 1
+                on_event({"type": "log_replace", "replace_id": "cap_progress",
+                          "msg": f"  [{n_done}/{len(all_reels)}] ✗ {str(exc)[:80]}"})
             finally:
                 caption_queue.task_done()
         await cap_page.close()
@@ -192,9 +216,12 @@ async def scrape_reels(playwright: Playwright, thread_url: str, data_dir: Path, 
             for r in reels:
                 if r["url"] not in seen_urls:
                     seen_urls.add(r["url"])
+                    r["source_label"] = source_label
                     all_reels.append(r)
-                    on_event({"type": "reel", "data": r})
-                    caption_queue.put_nowait(r)  # hand off to worker immediately
+                    if r["url"] not in known_urls:
+                        on_event({"type": "reel", "data": r})
+                        caption_queue.put_nowait(r)
+                    # known URLs are silently counted — shown in scroll status
         except Exception:
             pass
 
@@ -220,9 +247,14 @@ async def scrape_reels(playwright: Playwright, thread_url: str, data_dir: Path, 
             no_change = 0
             prev_count = len(all_reels)
 
-        on_event({"type": "log", "msg": f"{len(all_reels)} reels found, {caption_queue.qsize()} captions pending..."})
+        new_count = sum(1 for r in all_reels if r["url"] not in known_urls)
+        skip_count = len(all_reels) - new_count
+        skip_str = f", {skip_count} skipped" if skip_count else ""
+        on_event({"type": "log_replace", "replace_id": "scroll_status",
+                  "msg": f"{len(all_reels)} reels found ({new_count} new{skip_str}), {caption_queue.qsize()} captions pending…"})
 
-    on_event({"type": "log", "msg": f"Scroll done — waiting for {caption_queue.qsize()} remaining captions..."})
+    on_event({"type": "log_replace", "replace_id": "scroll_status",
+              "msg": f"Scroll done — waiting for {caption_queue.qsize()} remaining captions…"})
 
     # Drain the caption queue before closing
     await caption_queue.join()
@@ -230,10 +262,8 @@ async def scrape_reels(playwright: Playwright, thread_url: str, data_dir: Path, 
     await worker
     await browser.close()
 
-    for r in all_reels:
-        r["source_label"] = source_label
-
-    enriched = sum(1 for r in all_reels if r.get("caption"))
-    on_event({"type": "log", "msg": f"Thread done — {len(all_reels)} reels, {enriched} captions"})
+    new_reels = [r for r in all_reels if r["url"] not in known_urls]
+    enriched = sum(1 for r in new_reels if r.get("caption"))
+    on_event({"type": "log", "msg": f"Thread done — {len(new_reels)} new reels, {enriched} captions"})
 
     return all_reels
