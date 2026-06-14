@@ -11,8 +11,8 @@ Locally-hosted tool to scrape, download, caption, and transcribe Instagram reels
 **Requirements:** Python 3.11+, Node.js 18+, ffmpeg
 
 ```bash
-git clone <repo>
-cd ig-personal-dm-scrapper
+git clone https://github.com/the-pushh/life-offline.git
+cd life-offline
 ./start.sh
 ```
 
