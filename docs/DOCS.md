@@ -7,11 +7,12 @@
 3. [Adding sources](#adding-sources)
 4. [Table actions](#table-actions)
 5. [Filter chips & batch actions](#filter-chips--batch-actions)
-6. [Data files](#data-files)
-7. [GPU transcription](#gpu-transcription)
-8. [Rate limits](#rate-limits)
-9. [Troubleshooting](#troubleshooting)
-10. [Docker](#docker)
+6. [Building a knowledge base](#building-a-knowledge-base)
+7. [Data files](#data-files)
+8. [GPU transcription](#gpu-transcription)
+9. [Rate limits](#rate-limits)
+10. [Troubleshooting](#troubleshooting)
+11. [Docker](#docker)
 
 ---
 
@@ -24,7 +25,7 @@ LifeOffline runs two local servers:
 | FastAPI backend | 8000 | Playwright browser automation, instaloader downloads, Whisper transcription, SQLite DB |
 | Next.js frontend | 3000 | UI — connects to backend via HTTP + WebSocket |
 
-All data is stored in `data/` inside the project directory. No external APIs, no cloud storage.
+All data is stored in `data/` inside the project directory. No external APIs, no cloud storage. (The one opt-in exception: AI summaries, see [Building a knowledge base](#building-a-knowledge-base).)
 
 ---
 
@@ -126,6 +127,49 @@ Use filter + select-all to quickly re-run failed items.
 
 ---
 
+## Building a knowledge base
+
+Flip the toggle at the top from **Library** to **Review → KB**. You get one reel at a time and decide what it's worth.
+
+### 1. Scrape the whole DM
+
+Click **⋯ → Sync** on the source tab and pick **Full rescan (whole thread)**. It scrolls back to the very first message and waits longer for slow loads. A normal sync stops after 5 quiet scroll rounds; a full rescan waits 15. Pages of plain text messages count as progress, so a long chat between reels won't end the scan early.
+
+### 2. Fold duplicates
+
+Dedupe runs automatically after every scrape. You can rerun it with **⧉ Find duplicates**. Two reels are the same entry when:
+
+- they share a shortcode (`/reel/X/` and `/p/X/` are the same post), or
+- their caption + transcript text is at least 80% identical (reposts by other accounts). Instagram's `12K likes, 3 comments - user on…` wrapper and hashtags are stripped first. Captions under ~10 words are never text-matched, so `#fyp #viral` posts don't merge.
+
+The richest copy (has a transcript, then media, then the longest caption) stays in the queue. The rest show as "Shared N×" on its card. Tune the threshold with `DEDUPE_THRESHOLD=0.85`.
+
+### 3. Decide
+
+| Key | Decision | Goes into the KB as |
+|-----|----------|---------------------|
+| `1` | **Keep** | Bulleted key points + your notes |
+| `2` | **Summarize** | A 2-4 sentence summary + your notes |
+| `3` | **Keep full** | Cleaned caption + full transcript, verbatim |
+| `4` | **Discard** | Left out |
+
+Other keys: `←` `→` move, `Z` undo, `N` jump to notes (`Esc` to leave), `O` play the reel. Decisions save instantly. The queue starts on **To review**, so a decided reel drops out and the next one slides in.
+
+Transcribe reels before you review them if you can. **Keep full** and summaries are only as good as the transcript.
+
+### 4. Summarize
+
+**✎ Summarize** fills in summaries and key points for every reel marked Keep or Summarize that doesn't have one yet. Each card also has **Regenerate**.
+
+- **Default (offline):** a simple extractive summary built from the caption and transcript sentences. Nothing leaves your machine.
+- **AI summaries (opt-in):** set `ANTHROPIC_API_KEY` before `./start.sh` and summaries come from Claude (`claude-opus-5-5`, override with `SUMMARY_MODEL`). This sends each reel's caption and transcript text to the Anthropic API. Media files are never sent.
+
+### 5. Export
+
+**↓ Export KB** downloads `knowledge_base.md` (also saved to `data/knowledge_base.md`), grouped into Kept in full, Key points, and Summaries. **JSON** gives the same entries as structured data for importing into Notion, Obsidian, or a RAG pipeline.
+
+---
+
 ## Data files
 
 | Path | Description |
@@ -134,6 +178,7 @@ Use filter + select-all to quickly re-run failed items.
 | `data/media/<shortcode>/` | Downloaded images and videos per post |
 | `data/audio/<shortcode>.mp3` | Extracted audio for transcription |
 | `data/session.json` | Instagram session cookies (Playwright storage state) |
+| `data/knowledge_base.md` | Last knowledge base export |
 
 Export from the UI to get portable JSON/URL list files.
 

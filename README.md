@@ -28,6 +28,7 @@ That's it. `start.sh` installs all dependencies and starts both servers on first
 2. Choose **DM Thread** (paste thread URL) or **Saved Posts** (paste your username)
 3. Click **Scrape & add** — a browser window opens for Instagram login on first run
 4. Once scraped: use **Captions**, **Download media**, **Transcribe** buttons per tab
+5. Switch to **Review → KB** to triage every reel (Keep / Summarize / Keep full / Discard) and export a markdown knowledge base. Duplicates are folded automatically.
 
 > Session is saved to `data/session.json` and reused. Delete it to force re-login.
 

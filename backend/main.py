@@ -6,10 +6,10 @@ from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from backend import db
+from backend import db, knowledge
 from backend.scraper import scrape_reels
 from backend.saved_posts import scrape_saved_posts
 from backend.enricher import (
@@ -52,6 +52,7 @@ class ScrapeRequest(BaseModel):
     thread_url: str | None = None
     sources: list[dict] | None = None
     download_media: bool = False
+    full_scan: bool = False
 
 
 class SingleReelRequest(BaseModel):
@@ -67,12 +68,29 @@ class EnrichRequest(BaseModel):
     urls: list[str] | None = None
 
 
+class DecisionRequest(BaseModel):
+    url: str
+    decision: str | None = None   # keep | summarize | full | discard | None (reset)
+    notes: str | None = None
+
+
+class NotesRequest(BaseModel):
+    url: str
+    notes: str
+
+
+class SummarizeRequest(BaseModel):
+    urls: list[str] | None = None
+    force: bool = False
+
+
 async def scrape_sources(
     playwright,
     sources: list[dict],
     data_dir: Path,
     on_event,
     download_media: bool = False,
+    full_scan: bool = False,
 ) -> None:
     seen_urls: set[str] = db.get_urls()
     all_new: list[dict] = []
@@ -92,7 +110,8 @@ async def scrape_sources(
             label = source.get("name", "").strip() or default_label
             dm_idx += 1
             on_event({"type": "log", "msg": f"── {label}: {url[:60]}"})
-            new_reels = await scrape_reels(playwright, url, data_dir, on_event, source_label=label, known_urls=seen_urls)
+            new_reels = await scrape_reels(playwright, url, data_dir, on_event, source_label=label,
+                                           known_urls=seen_urls, full_scan=full_scan)
         elif stype == "saved":
             username = source.get("username", "").strip().lstrip("@")
             if not username:
@@ -126,6 +145,10 @@ async def scrape_sources(
                 dl_ok += 1
         on_event({"type": "log_replace", "replace_id": "dl_progress",
                   "msg": f"✓ Media — {dl_ok}/{n_dl} downloaded"})
+
+    stats = knowledge.dedupe()
+    if stats["duplicates"]:
+        on_event({"type": "log", "msg": f"⧉ {stats['duplicates']} duplicates folded into {stats['groups']} groups"})
 
     total = db.count()
     enriched = db.count_with_captions()
@@ -171,7 +194,8 @@ async def start_scrape(req: ScrapeRequest):
 
     async def run(q: asyncio.Queue):
         async with async_playwright() as pw:
-            await scrape_sources(pw, sources, DATA_DIR, q.put_nowait, download_media=req.download_media)
+            await scrape_sources(pw, sources, DATA_DIR, q.put_nowait,
+                                 download_media=req.download_media, full_scan=req.full_scan)
 
     return {"job_id": _start_job(run)}
 
@@ -394,6 +418,59 @@ async def export_json():
         media_type="application/json",
         headers={"Content-Disposition": "attachment; filename=reels.json"},
     )
+
+
+# ── knowledge base ─────────────────────────────────────────────────────────────
+
+@app.post("/api/kb/dedupe")
+async def kb_dedupe():
+    return knowledge.dedupe()
+
+
+@app.post("/api/kb/decision")
+async def kb_decision(req: DecisionRequest):
+    if req.decision is not None and req.decision not in db.DECISIONS:
+        return JSONResponse({"error": f"decision must be one of {sorted(db.DECISIONS)}"}, status_code=400)
+    if not db.get_by_url(req.url):
+        return JSONResponse({"error": "Unknown reel"}, status_code=404)
+    db.set_decision(req.url, req.decision, req.notes)
+    return db.get_by_url(req.url)
+
+
+@app.post("/api/kb/notes")
+async def kb_notes(req: NotesRequest):
+    db.set_notes(req.url, req.notes)
+    return {"ok": True}
+
+
+@app.post("/api/kb/summarize")
+async def kb_summarize(req: SummarizeRequest = SummarizeRequest()):
+    if _current_job:
+        return JSONResponse({"error": "A job is already running"}, status_code=409)
+
+    async def run(q: asyncio.Queue):
+        await knowledge.summarize(q.put_nowait, req.urls, force=req.force)
+
+    return {"job_id": _start_job(run)}
+
+
+@app.get("/api/kb/status")
+async def kb_status():
+    return {"llm": knowledge.llm_enabled(), "model": knowledge.SUMMARY_MODEL if knowledge.llm_enabled() else None}
+
+
+@app.get("/api/kb/export")
+async def kb_export(format: str = "md"):
+    if format == "json":
+        return Response(
+            content=json.dumps(knowledge.export_json(), ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=knowledge_base.json"},
+        )
+    content = knowledge.export_markdown()
+    (DATA_DIR / "knowledge_base.md").write_text(content)
+    return Response(content=content, media_type="text/markdown",
+                    headers={"Content-Disposition": "attachment; filename=knowledge_base.md"})
 
 
 @app.websocket("/ws/{job_id}")

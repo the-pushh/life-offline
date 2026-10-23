@@ -4,7 +4,7 @@ import { useState } from "react";
 import type { Reel } from "@/lib/api";
 import { mediaFileUrl } from "@/lib/api";
 
-type Status = "idle" | "scraping" | "captions" | "transcripts" | "downloading";
+type Status = "idle" | "scraping" | "captions" | "transcripts" | "downloading" | "summarizing";
 type Filter = "all" | "no_media" | "no_caption" | "no_transcript";
 
 interface Props {

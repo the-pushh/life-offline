@@ -11,6 +11,7 @@ import AddSourceModal from "@/components/AddSourceModal";
 import SkyBackground from "@/components/SkyBackground";
 import StatsBar from "@/components/StatsBar";
 import TranscriptionBubble from "@/components/TranscriptionBubble";
+import ReviewPanel from "@/components/ReviewPanel";
 import {
   fetchStatus,
   fetchReels,
@@ -25,14 +26,20 @@ import {
   deleteSource,
   cancelJob,
   openJobSocket,
+  runDedupe,
+  setDecision,
+  saveNotes,
+  startSummarize,
+  fetchKbStatus,
   API_BASE,
+  type Decision,
   type Reel,
   type Source,
   type StoredSource,
   type WsEvent,
 } from "@/lib/api";
 
-type Status = "idle" | "scraping" | "captions" | "transcripts" | "downloading";
+type Status = "idle" | "scraping" | "captions" | "transcripts" | "downloading" | "summarizing";
 
 let _lineId = 0;
 function nextId() { return ++_lineId; }
@@ -68,6 +75,8 @@ export default function Home() {
   const [downloadProgress, setDownloadProgress] = useState({ current: 0, total: 0 });
   const [transcribingUrls, setTranscribingUrls] = useState<Set<string>>(new Set());
   const [downloadingUrls, setDownloadingUrls] = useState<Set<string>>(new Set());
+  const [view, setView] = useState<"library" | "review">("library");
+  const [kbStatus, setKbStatus] = useState<{ llm: boolean; model: string | null }>({ llm: false, model: null });
   const socketRef = useRef<WebSocket | null>(null);
   const stallTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -132,6 +141,8 @@ export default function Home() {
   useEffect(() => {
     fetchStatus().then((s) => setSessionExists(s.session_exists));
     fetchReels().then((r) => { if (r.length > 0) setReels(r); });
+    fetchKbStatus().then(setKbStatus).catch(() => {});
+    if (localStorage.getItem("lo_view") === "review") setView("review");
 
     const stored = loadStoredSources();
     setConfiguredSources(stored);
@@ -141,6 +152,9 @@ export default function Home() {
       stored.length > 0 || localStorage.getItem("lo_sources_configured");
     if (!configured) setShowOnboarding(true);
   }, []);
+
+  // Declared after bootstrap so the saved view is read before the first write
+  useEffect(() => { localStorage.setItem("lo_view", view); }, [view]);
 
   const addLog = useCallback((text: string, kind?: "info" | "success" | "error" | "reel") => {
     const lineKind = kind ?? classifyLine(text);
@@ -301,6 +315,16 @@ export default function Home() {
           }
           break;
 
+        case "kb_update":
+          if (event.url) {
+            setReels((prev) =>
+              prev.map((r) =>
+                r.url === event.url ? { ...r, summary: event.summary, key_points: event.key_points } : r
+              )
+            );
+          }
+          break;
+
         case "done":
           if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
           addLog(`✓ Done — ${event.count ?? 0} items`, "success");
@@ -309,6 +333,7 @@ export default function Home() {
           setTranscribingUrls(new Set());
           setDownloadProgress({ current: 0, total: 0 });
           if (jobStatus === "scraping" || jobStatus === "downloading") {
+            // Scrape also re-runs dedupe server-side, so reload to pick up duplicate_of
             fetchReels().then((r) => { if (r.length > 0) setReels(r); });
           }
           break;
@@ -422,11 +447,11 @@ export default function Home() {
     handleScrape([source], downloadMedia);
   }
 
-  async function handleRescrapeSource(name: string, downloadMedia = false) {
+  async function handleRescrapeSource(name: string, downloadMedia = false, fullScan = false) {
     const source = configuredSources.find((s) => s.name === name);
     if (!source) return;
-    addLog(`Syncing latest for ${name}…`);
-    const res = await startScrape([source], downloadMedia);
+    addLog(fullScan ? `Full rescan of ${name} (scrolls to the very first message)…` : `Syncing latest for ${name}…`);
+    const res = await startScrape([source], downloadMedia, fullScan);
     if (res.error) { addLog(`✗ ${res.error}`, "error"); return; }
     connectJob(res.job_id!, "scraping");
   }
@@ -457,6 +482,34 @@ export default function Home() {
       if (res.error) { addLog(`✗ ${res.error}`, "error"); return; }
       connectJob(res.job_id!, "transcripts");
     }
+  }
+
+  async function handleDecision(url: string, decision: Decision | null) {
+    const prev = reels.find((r) => r.url === url);
+    setReels((rs) => rs.map((r) => (r.url === url ? { ...r, decision } : r)));
+    const res = await setDecision(url, decision).catch(() => null);
+    if (!res || res.error) {
+      toast.error(res?.error ?? "Couldn't save decision — check backend connection");
+      if (prev) setReels((rs) => rs.map((r) => (r.url === url ? { ...r, decision: prev.decision } : r)));
+    }
+  }
+
+  async function handleNotes(url: string, notes: string) {
+    setReels((rs) => rs.map((r) => (r.url === url ? { ...r, notes } : r)));
+    await saveNotes(url, notes).catch(() => toast.error("Couldn't save notes"));
+  }
+
+  async function handleDedupe() {
+    const res = await runDedupe();
+    addLog(`⧉ ${res.duplicates} duplicates folded into ${res.groups} groups — ${res.unique} unique reels`, "success");
+    setReels(await fetchReels());
+  }
+
+  async function handleSummarize(urls?: string[], force = false) {
+    addLog(urls?.length === 1 ? "Summarizing reel…" : "Summarizing reels marked Keep / Summarize…");
+    const res = await startSummarize(urls, force);
+    if (res.error) { addLog(`✗ ${res.error}`, "error"); return; }
+    connectJob(res.job_id!, "summarizing");
   }
 
   async function handleRemoveSource(name: string) {
@@ -492,8 +545,23 @@ export default function Home() {
       <main className="flex-1 overflow-hidden flex flex-col min-h-0">
         <div className={innerClass}>
           {/* Export row */}
-          <div className="flex items-center justify-between gap-2 mb-4 flex-shrink-0">
-            <StatsBar reels={filteredReels} />
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-4 flex-shrink-0">
+            <div className="flex items-center gap-3 min-w-0 flex-wrap">
+              <div className="flex rounded-lg border border-border/70 bg-surface/60 backdrop-blur-sm p-0.5 flex-shrink-0">
+                {(["library", "review"] as const).map((v) => (
+                  <button
+                    key={v}
+                    onClick={() => setView(v)}
+                    className={`text-xs px-3 py-1 rounded-md transition-colors ${
+                      view === v ? "bg-accent text-white" : "text-muted hover:text-primary"
+                    }`}
+                  >
+                    {v === "library" ? "Library" : "Review → KB"}
+                  </button>
+                ))}
+              </div>
+              <StatsBar reels={filteredReels} />
+            </div>
             <div className="flex items-center gap-2 flex-shrink-0">
               <a
                 href={`${API_BASE}/api/export/json`}
@@ -540,6 +608,21 @@ export default function Home() {
                 onSearchChange={setSearch}
               />
             )}
+            {view === "review" && configuredSources.length > 0 ? (
+              <ReviewPanel
+                reels={filteredReels}
+                allReels={reels}
+                busy={isActive}
+                llm={kbStatus}
+                onDecision={handleDecision}
+                onNotes={handleNotes}
+                onSummarize={handleSummarize}
+                onDedupe={handleDedupe}
+                onOpen={setVideoModal}
+                onTranscriptFetch={handleTranscriptRefetch}
+                onDownload={handleDownloadReel}
+              />
+            ) : (
             <ReelsTable
               reels={filteredReels}
               status={status}
@@ -554,6 +637,7 @@ export default function Home() {
               onAddSource={() => setShowAddSource(true)}
               onRunOnSelected={handleRunOnSelected}
             />
+            )}
           </div>
         </div>
       </main>
@@ -615,6 +699,13 @@ export default function Home() {
                 onClick={() => { const t = rescrapeTarget; setRescrapeTarget(null); handleRescrapeSource(t!, false); }}
               >
                 Sync only
+              </button>
+              <button
+                className="w-full py-2.5 rounded-xl border border-border text-primary font-medium text-sm hover:bg-black/5 transition-colors"
+                title="Scrolls all the way back to the first message with longer waits. Slow on big threads."
+                onClick={() => { const t = rescrapeTarget; setRescrapeTarget(null); handleRescrapeSource(t!, false, true); }}
+              >
+                Full rescan (whole thread)
               </button>
               <button
                 className="w-full py-2 text-muted text-sm hover:text-primary transition-colors"

@@ -56,7 +56,24 @@ def _apply_schema() -> None:
         CREATE INDEX IF NOT EXISTS idx_url   ON reels(url);
         CREATE INDEX IF NOT EXISTS idx_label ON reels(source_label);
     """)
+    # Knowledge-base review columns, added in place so existing DBs keep their data
+    existing = {r["name"] for r in _conn().execute("PRAGMA table_info(reels)").fetchall()}
+    for col, ddl in _KB_COLUMNS.items():
+        if col not in existing:
+            _conn().execute(f"ALTER TABLE reels ADD COLUMN {col} {ddl}")
     _conn().commit()
+
+
+# decision: keep (key points) | summarize | full (verbatim) | discard | NULL (pending)
+_KB_COLUMNS = {
+    "decision":     "TEXT",
+    "notes":        "TEXT",
+    "summary":      "TEXT",
+    "key_points":   "TEXT",   # JSON list of strings
+    "duplicate_of": "TEXT",   # url of the canonical reel this one duplicates
+    "reviewed_at":  "TEXT",
+}
+DECISIONS = {"keep", "summarize", "full", "discard"}
 
 
 def _migrate_json(data_dir: Path) -> None:
@@ -89,6 +106,12 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
             d["image_paths"] = []
     elif not raw:
         d["image_paths"] = None
+    kp = d.get("key_points")
+    if isinstance(kp, str) and kp:
+        try:
+            d["key_points"] = json.loads(kp)
+        except Exception:
+            d["key_points"] = None
     return d
 
 
@@ -231,4 +254,57 @@ def get_without_media(source_label: str | None = None) -> list[dict]:
         rows = _conn().execute(
             "SELECT * FROM reels WHERE video_path IS NULL AND image_paths IS NULL"
         ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+# ── knowledge base ─────────────────────────────────────────────────────────────
+
+def set_decision(url: str, decision: str | None, notes: str | None = None) -> None:
+    """decision=None resets the reel to pending. notes=None leaves notes untouched."""
+    if notes is None:
+        _conn().execute(
+            "UPDATE reels SET decision = ?, reviewed_at = CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, "
+            "updated_at = datetime('now') WHERE url = ?",
+            (decision, decision, url),
+        )
+    else:
+        _conn().execute(
+            "UPDATE reels SET decision = ?, notes = ?, reviewed_at = CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, "
+            "updated_at = datetime('now') WHERE url = ?",
+            (decision, notes or None, decision, url),
+        )
+    _conn().commit()
+
+
+def set_notes(url: str, notes: str) -> None:
+    _conn().execute(
+        "UPDATE reels SET notes = ?, updated_at = datetime('now') WHERE url = ?",
+        (notes or None, url),
+    )
+    _conn().commit()
+
+
+def set_summary(url: str, summary: str, key_points: list[str]) -> None:
+    _conn().execute(
+        "UPDATE reels SET summary = ?, key_points = ?, updated_at = datetime('now') WHERE url = ?",
+        (summary or None, json.dumps(key_points) if key_points else None, url),
+    )
+    _conn().commit()
+
+
+def set_duplicates(canonical_of: dict[str, str | None]) -> None:
+    """Bulk-write duplicate_of for every url in the mapping (None = canonical)."""
+    _conn().executemany(
+        "UPDATE reels SET duplicate_of = ? WHERE url = ?",
+        [(canon, url) for url, canon in canonical_of.items()],
+    )
+    _conn().commit()
+
+
+def get_decided(decisions: set[str]) -> list[dict]:
+    marks = ",".join("?" * len(decisions))
+    rows = _conn().execute(
+        f"SELECT * FROM reels WHERE duplicate_of IS NULL AND decision IN ({marks}) ORDER BY id",
+        tuple(decisions),
+    ).fetchall()
     return [_row_to_dict(r) for r in rows]

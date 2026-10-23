@@ -15,7 +15,15 @@ export interface Reel {
   post_type?: "video" | "image" | "carousel_image" | "carousel_video";
   source?: "dm" | "saved";
   source_label?: string;
+  id?: number;
+  decision?: Decision | null;
+  notes?: string | null;
+  summary?: string | null;
+  key_points?: string[] | null;
+  duplicate_of?: string | null;
 }
+
+export type Decision = "keep" | "summarize" | "full" | "discard";
 
 export interface Source {
   type: "dm" | "saved";
@@ -46,6 +54,7 @@ export interface WsEvent {
     | "caption_update"
     | "transcript_update"
     | "reel_update"
+    | "kb_update"
     | "done"
     | "error";
   msg?: string;
@@ -62,6 +71,8 @@ export interface WsEvent {
   media?: { video_path?: string; image_paths?: string[]; post_type?: string; thumbnail?: string };
   stage?: "scrape" | "captions" | "transcripts";
   count?: number;
+  summary?: string;
+  key_points?: string[];
 }
 
 export interface StatusResponse {
@@ -97,12 +108,13 @@ export async function fetchReels(): Promise<Reel[]> {
 
 export async function startScrape(
   sources: Source[],
-  downloadMedia = false
+  downloadMedia = false,
+  fullScan = false
 ): Promise<{ job_id?: string; error?: string }> {
   const r = await fetch(`${API_BASE}/api/scrape`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sources, download_media: downloadMedia }),
+    body: JSON.stringify({ sources, download_media: downloadMedia, full_scan: fullScan }),
   });
   return r.json();
 }
@@ -163,6 +175,55 @@ export async function downloadVideo(url: string): Promise<{ job_id?: string; err
     body: JSON.stringify({ url }),
   });
   return r.json();
+}
+
+export async function runDedupe(): Promise<{ groups: number; duplicates: number; unique: number }> {
+  const r = await fetch(`${API_BASE}/api/kb/dedupe`, { method: "POST" });
+  return r.json();
+}
+
+export async function setDecision(
+  url: string,
+  decision: Decision | null,
+  notes?: string
+): Promise<Reel & { error?: string }> {
+  const r = await fetch(`${API_BASE}/api/kb/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, decision, notes: notes ?? null }),
+  });
+  return r.json();
+}
+
+export async function saveNotes(url: string, notes: string): Promise<void> {
+  await fetch(`${API_BASE}/api/kb/notes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, notes }),
+  });
+}
+
+export async function startSummarize(urls?: string[], force = false): Promise<{ job_id?: string; error?: string }> {
+  const r = await fetch(`${API_BASE}/api/kb/summarize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ urls: urls ?? null, force }),
+  });
+  return r.json();
+}
+
+export async function fetchKbStatus(): Promise<{ llm: boolean; model: string | null }> {
+  const r = await fetch(`${API_BASE}/api/kb/status`);
+  return r.json();
+}
+
+/** Strip Instagram's og:description wrapper: `12K likes, 3 comments - user on Mar 3, 2024: "…".` */
+export function cleanCaption(caption?: string | null): string {
+  if (!caption) return "";
+  return caption
+    .replace(/^\s*[\d.,]+[KkMm]?\s+likes?,\s*[\d.,]+[KkMm]?\s+comments?\s*-\s*\S+\s+on\s+[^:]{3,40}:\s*"?/, "")
+    .replace(/"\.?\s*$/, "")
+    .trim();
 }
 
 export function videoUrl(reelId: string): string {

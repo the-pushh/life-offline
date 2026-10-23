@@ -48,11 +48,8 @@ def _extract_caption(html: str) -> str | None:
     return None
 
 
-def extract_reels_from_response(data: dict) -> list[dict]:
-    reels = []
-    d = data.get("data", {})
-
-    messages_node = None
+def _find_messages_node(data: dict) -> dict | None:
+    d = data.get("data") or {}
     for getter in [
         lambda: d["fetch__SlideThread"]["as_ig_direct_thread"]["slide_messages"],
         lambda: d["fetch__SlideThread"]["as_ig_direct_thread"]["messages"],
@@ -62,11 +59,17 @@ def extract_reels_from_response(data: dict) -> list[dict]:
         lambda: d["get_slide_thread_nullable"]["as_ig_direct_thread"]["slide_messages"],
     ]:
         try:
-            messages_node = getter()
-            break
+            node = getter()
+            if node:
+                return node
         except (KeyError, TypeError):
             continue
+    return None
 
+
+def extract_reels_from_response(data: dict) -> list[dict]:
+    reels = []
+    messages_node = _find_messages_node(data)
     if not messages_node:
         return reels
 
@@ -127,7 +130,15 @@ async def scrape_reels(
     on_event,
     source_label: str = "DM",
     known_urls: set[str] | None = None,
+    full_scan: bool = False,
 ) -> list[dict]:
+    """Scroll the thread to the top, collecting every shared post.
+
+    Stops after `patience` scroll rounds where no new message page loaded.
+    A page of plain text messages still counts as progress, so long stretches
+    without reels don't end the scan early. full_scan waits much longer for
+    slow loads on very old threads.
+    """
     session_file = data_dir / "session.json"
     if not session_file.exists():
         await login_and_save_session(playwright, data_dir, on_event)
@@ -136,6 +147,8 @@ async def scrape_reels(
     all_reels: list[dict] = []
     seen_urls: set[str] = set()
     n_done = 0
+    seen_message_ids: set[str] = set()
+    patience = 15 if full_scan else 5
 
     browser = await playwright.chromium.launch(headless=False)
     context = await browser.new_context(
@@ -212,6 +225,12 @@ async def scrape_reels(
             if body.startswith("for (;;);"):
                 body = body[len("for (;;);"):]
             data = json.loads(body)
+            node = _find_messages_node(data)
+            for edge in (node or {}).get("edges", []):
+                n = edge.get("node") or {}
+                mid = n.get("message_id") or n.get("id") or n.get("timestamp_ms")
+                if mid:
+                    seen_message_ids.add(str(mid))
             reels = extract_reels_from_response(data)
             for r in reels:
                 if r["url"] not in seen_urls:
@@ -233,25 +252,32 @@ async def scrape_reels(
     await page.wait_for_timeout(500)
 
     no_change = 0
-    prev_count = 0
+    prev_progress = (0, 0)
+    mode = "full scan" if full_scan else "scan"
 
-    while no_change < 4:
+    while no_change < patience:
         for _ in range(6):
             await page.mouse.wheel(0, -800)
             await page.wait_for_timeout(200)
-        await page.wait_for_timeout(2_500)
+        await page.wait_for_timeout(4_000 if full_scan and no_change else 2_500)
 
-        if len(all_reels) == prev_count:
+        progress = (len(all_reels), len(seen_message_ids))
+        if progress == prev_progress:
             no_change += 1
+            if no_change % 3 == 0:
+                # Nudge: scroll down a bit and back up to retrigger the loader
+                await page.mouse.wheel(0, 1600)
+                await page.wait_for_timeout(600)
         else:
             no_change = 0
-            prev_count = len(all_reels)
+            prev_progress = progress
 
         new_count = sum(1 for r in all_reels if r["url"] not in known_urls)
         skip_count = len(all_reels) - new_count
         skip_str = f", {skip_count} skipped" if skip_count else ""
         on_event({"type": "log_replace", "replace_id": "scroll_status",
-                  "msg": f"{len(all_reels)} reels found ({new_count} new{skip_str}), {caption_queue.qsize()} captions pending…"})
+                  "msg": f"{len(all_reels)} reels in {len(seen_message_ids)} messages ({new_count} new{skip_str}), "
+                         f"{caption_queue.qsize()} captions pending… [{mode} {no_change}/{patience}]"})
 
     on_event({"type": "log_replace", "replace_id": "scroll_status",
               "msg": f"Scroll done — waiting for {caption_queue.qsize()} remaining captions…"})

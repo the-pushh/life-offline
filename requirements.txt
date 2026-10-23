@@ -5,3 +5,4 @@ playwright
 python-dotenv
 faster-whisper
 instaloader
+anthropic
